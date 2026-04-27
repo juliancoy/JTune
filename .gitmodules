@@ -1,0 +1,3 @@
+[submodule "vendor/Loiacono"]
+	path = vendor/Loiacono
+	url = https://github.com/juliancoy/Loiacono

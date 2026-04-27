@@ -1,0 +1,18 @@
+[project]
+name = "jtune"
+version = "0.1.0"
+description = "Autotune app wrapped around Loiacono transform"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "librosa>=0.10.0",
+  "numpy>=1.24",
+  "soundfile>=0.12.1"
+]
+
+[project.scripts]
+jtune = "autotune_app.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
