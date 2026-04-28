@@ -1,7 +1,12 @@
 __pycache__/
 *.pyc
 .venv/
-build/
+build*
+!build.sh
 dist/
 *.egg-info/
 output/
+*.env
+.env
+.env.*
+tests/sounds/*.wav
