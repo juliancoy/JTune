@@ -1,4 +1,5 @@
 #include "autotune_core.h"
+#include "pitch_system.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -181,8 +182,6 @@ int main(int argc, char** argv)
 
     jtune::AutotuneOptions opts;
     opts.sampleRate = 48000;
-    opts.keyRoot = 0;
-    opts.minor = false;
     opts.strength = 1.0f;
     opts.wetMix = 1.0f;
     opts.minMidi = 40;
@@ -215,8 +214,19 @@ int main(int argc, char** argv)
         if (arg == "--in") inPath = next();
         else if (arg == "--out") outPath = next();
         else if (arg == "--sample-rate") opts.sampleRate = static_cast<unsigned int>(std::stoul(next()));
-        else if (arg == "--key") opts.keyRoot = parseKeyRoot(next());
-        else if (arg == "--scale") opts.minor = std::string(next()) == "minor";
+        else if (arg == "--pitch-system") opts.pitchSystemId = next();
+        else if (arg == "--tuning-file") {
+            std::vector<std::string> errors;
+            if (!jtune::pitchSystemRegistry().loadFile(next(), errors)) { for (const auto& e : errors) std::cerr << e << '\n'; return 2; }
+            opts.pitchSystemId = jtune::pitchSystemRegistry().definitions().back().id;
+        }
+        else if (arg == "--reference-note") opts.referenceMidiNote = std::stoi(next());
+        else if (arg == "--reference-hz") opts.baseAFrequencyHz = std::stod(next());
+        else if (arg == "--octave-shift") opts.octaveShift = std::stoi(next());
+        else if (arg == "--pitch-collection") opts.pitchCollectionId = next();
+        else if (arg == "--tonic-note") opts.tonicMidiNote = std::stoi(next());
+        else if (arg == "--degrees") { const auto values = jtune::parsePitchDegreeList(next()); if (!values) return 2; opts.pitchCollectionId = "custom"; opts.customEnabledDegrees = *values; }
+        else if (arg == "--key" || arg == "--scale") { std::cerr << arg << " was removed\n"; return 2; }
         else if (arg == "--strength") opts.strength = std::stof(next());
         else if (arg == "--wet") opts.wetMix = std::stof(next());
         else if (arg == "--min-midi") opts.minMidi = std::stoi(next());

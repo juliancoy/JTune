@@ -1,0 +1,67 @@
+{
+  "source_doi": "10.5281/zenodo.15682346",
+  "artifact_md5": "9f8b9cdadf88ddb93d50a90d4ddc544e",
+  "correction_enabled_by_explicit_user_acceptance": false,
+  "profiles": [
+    {
+      "file": "egypt-bayati.json",
+      "id": "org.jtune.ord-cc32.egypt.bayati",
+      "recordings": 17,
+      "correction_eligible": false
+    },
+    {
+      "file": "egypt-hijaz.json",
+      "id": "org.jtune.ord-cc32.egypt.hijaz",
+      "recordings": 4,
+      "correction_eligible": false
+    },
+    {
+      "file": "egypt-husayni.json",
+      "id": "org.jtune.ord-cc32.egypt.husayni",
+      "recordings": 2,
+      "correction_eligible": false
+    },
+    {
+      "file": "egypt-rast.json",
+      "id": "org.jtune.ord-cc32.egypt.rast",
+      "recordings": 13,
+      "correction_eligible": false
+    },
+    {
+      "file": "egypt-saba.json",
+      "id": "org.jtune.ord-cc32.egypt.saba",
+      "recordings": 9,
+      "correction_eligible": false
+    },
+    {
+      "file": "iraq-bayati.json",
+      "id": "org.jtune.ord-cc32.iraq.bayati",
+      "recordings": 3,
+      "correction_eligible": false
+    },
+    {
+      "file": "iraq-husayni.json",
+      "id": "org.jtune.ord-cc32.iraq.husayni",
+      "recordings": 3,
+      "correction_eligible": false
+    },
+    {
+      "file": "iraq-rast.json",
+      "id": "org.jtune.ord-cc32.iraq.rast",
+      "recordings": 3,
+      "correction_eligible": false
+    },
+    {
+      "file": "iraq-saba.json",
+      "id": "org.jtune.ord-cc32.iraq.saba",
+      "recordings": 2,
+      "correction_eligible": false
+    },
+    {
+      "file": "tunisia-husayni.json",
+      "id": "org.jtune.ord-cc32.tunisia.husayni",
+      "recordings": 2,
+      "correction_eligible": false
+    }
+  ]
+}

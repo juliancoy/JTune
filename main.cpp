@@ -1,4 +1,5 @@
 #include "autotune_core.h"
+#include "pitch_system.hpp"
 
 #include "RtAudio.h"
 
@@ -150,7 +151,8 @@ void printDevices(RtAudio& audio)
 
 void printUsage(const char* argv0)
 {
-    std::cout << "Usage: " << argv0 << " [--key C] [--scale major|minor] [--strength 1.0]"
+    std::cout << "Usage: " << argv0 << " [--pitch-system ID] [--tuning-file FILE]"
+              << " [--reference-note 69] [--reference-hz 440] [--octave-shift -2..2] [--strength 1.0]"
               << " [--sample-rate 48000] [--buffer-frames 256] [--min-midi 40] [--max-midi 84]"
               << " [--multiple 24] [--voiced-threshold 1.1] [--bin-count 128] [--analysis-hop 256]"
               << " [--freq-min 100] [--freq-max 3000] [--algorithm loiacono|fft|goertzel]"
@@ -177,23 +179,35 @@ bool parseArgs(int argc, char** argv, RuntimeOptions& opts, bool& showHelp)
             printUsage(argv[0]);
             showHelp = true;
             return false;
-        } else if (a == "--key") {
+        } else if (a == "--pitch-system") {
             if (!needValue(a)) return false;
-            const int key = parseKeyRoot(argv[++i]);
-            if (key < 0) {
-                std::cerr << "Invalid key\n";
+            opts.dsp.pitchSystemId = argv[++i];
+        } else if (a == "--tuning-file") {
+            if (!needValue(a)) return false;
+            std::vector<std::string> errors;
+            if (!jtune::pitchSystemRegistry().loadFile(argv[++i], errors)) {
+                for (const auto& error : errors) std::cerr << error << '\n';
                 return false;
             }
-            opts.dsp.keyRoot = key;
-        } else if (a == "--scale") {
+            opts.dsp.pitchSystemId = jtune::pitchSystemRegistry().definitions().back().id;
+        } else if (a == "--reference-note") {
+            if (!needValue(a)) return false; opts.dsp.referenceMidiNote = std::stoi(argv[++i]);
+        } else if (a == "--reference-hz") {
+            if (!needValue(a)) return false; opts.dsp.baseAFrequencyHz = std::stod(argv[++i]);
+        } else if (a == "--octave-shift") {
+            if (!needValue(a)) return false; opts.dsp.octaveShift = std::stoi(argv[++i]);
+        } else if (a == "--pitch-collection") {
+            if (!needValue(a)) return false; opts.dsp.pitchCollectionId = argv[++i];
+        } else if (a == "--tonic-note") {
+            if (!needValue(a)) return false; opts.dsp.tonicMidiNote = std::stoi(argv[++i]);
+        } else if (a == "--degrees") {
             if (!needValue(a)) return false;
-            std::string v = argv[++i];
-            if (v == "major") opts.dsp.minor = false;
-            else if (v == "minor") opts.dsp.minor = true;
-            else {
-                std::cerr << "Scale must be major or minor\n";
-                return false;
-            }
+            const auto values = jtune::parsePitchDegreeList(argv[++i]);
+            if (!values) { std::cerr << "Invalid comma-separated degree list\n"; return false; }
+            opts.dsp.pitchCollectionId = "custom"; opts.dsp.customEnabledDegrees = *values;
+        } else if (a == "--key" || a == "--scale") {
+            std::cerr << a << " was removed; choose an explicit pitch system and reference pitch\n";
+            return false;
         } else if (a == "--strength") {
             if (!needValue(a)) return false;
             opts.dsp.strength = std::clamp(std::stof(argv[++i]), 0.0f, 1.0f);
@@ -363,8 +377,9 @@ int main(int argc, char** argv)
             &state);
 
         std::cout << "JTune C++ autotune running. Press Ctrl+C to stop.\n";
-        std::cout << "key=" << options.dsp.keyRoot
-                  << " scale=" << (options.dsp.minor ? "minor" : "major")
+        std::cout << "pitch_system=" << options.dsp.pitchSystemId
+                  << " reference=" << options.dsp.referenceMidiNote << '@' << options.dsp.baseAFrequencyHz << "Hz"
+                  << " octave_shift=" << options.dsp.octaveShift
                   << " strength=" << options.dsp.strength
                   << " sr=" << options.dsp.sampleRate
                   << " buffer=" << frames
@@ -372,6 +387,11 @@ int main(int argc, char** argv)
                   << " hop=" << options.dsp.analysisHop
                   << " resynth=" << (options.dsp.resynthMode == jtune::TimeDomain ? "TimeDomain" : "FrequencyDomain")
                   << "\n";
+        if (const auto* definition = jtune::pitchSystemRegistry().byId(options.dsp.pitchSystemId))
+            std::cout << "pitch_system_version=" << definition->version
+                      << " source_hash=" << definition->sourceHash
+                      << " correction_eligible=" << (definition->correctionEligible ? "true" : "false")
+                      << " limitations=" << definition->limitations << "\n";
 
         audio.startStream();
         while (g_running.load()) {

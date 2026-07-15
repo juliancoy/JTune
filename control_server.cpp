@@ -1,5 +1,6 @@
 #include "autotune_core.h"
 #include "pitch_tracker.h"
+#include "pitch_system.hpp"
 
 #include <QCoreApplication>
 #include <QHostAddress>
@@ -30,34 +31,6 @@ double hzToMidi(double hz)
 double midiToHz(double midi)
 {
     return 440.0 * std::pow(2.0, (midi - 69.0) / 12.0);
-}
-
-bool inScaleForKey(int midiNote, int keyRoot, bool minor)
-{
-    static const int major[7] = {0, 2, 4, 5, 7, 9, 11};
-    static const int minorScale[7] = {0, 2, 3, 5, 7, 8, 10};
-    const int pc = ((midiNote % 12) + 12) % 12;
-    const int* intervals = minor ? minorScale : major;
-    for (int i = 0; i < 7; ++i) {
-        if (((intervals[i] + keyRoot) % 12) == pc) return true;
-    }
-    return false;
-}
-
-int nearestScaleMidiForKey(double detectedMidi, int keyRoot, bool minor)
-{
-    const int center = static_cast<int>(std::lround(detectedMidi));
-    int best = center;
-    double bestDist = 1e9;
-    for (int n = center - 24; n <= center + 24; ++n) {
-        if (!inScaleForKey(n, keyRoot, minor)) continue;
-        const double d = std::abs(static_cast<double>(n) - detectedMidi);
-        if (d < bestDist) {
-            bestDist = d;
-            best = n;
-        }
-    }
-    return best;
 }
 
 std::vector<float> generateChirp(unsigned int sampleRate, double seconds, double f0Hz, double f1Hz)
@@ -244,8 +217,16 @@ QJsonObject runChirpTest(const QUrlQuery& q)
     jtune::AutotuneOptions base;
     base.sampleRate = q.queryItemValue("sample_rate").toUInt();
     if (base.sampleRate == 0) base.sampleRate = 48000;
-    base.keyRoot = parseKeyRoot(queryOr("key", "C"));
-    base.minor = queryOr("scale", "major").trimmed().toLower() == "minor";
+    base.pitchSystemId = queryOr("pitch_system", "org.jtune.edo.12").toStdString();
+    base.pitchCollectionId = queryOr("pitch_collection", "all").toStdString();
+    base.tonicMidiNote = q.hasQueryItem("tonic_note") ? q.queryItemValue("tonic_note").toInt() : 60;
+    if (q.hasQueryItem("degrees")) {
+        const auto values = jtune::parsePitchDegreeList(q.queryItemValue("degrees").toStdString());
+        if (values) { base.pitchCollectionId = "custom"; base.customEnabledDegrees = *values; }
+    }
+    base.referenceMidiNote = q.queryItemValue("reference_note").toInt();
+    if (base.referenceMidiNote <= 0) base.referenceMidiNote = 69;
+    base.octaveShift = std::clamp(q.queryItemValue("octave_shift").toInt(), -2, 2);
     base.minMidi = q.queryItemValue("min_midi").toInt();
     if (base.minMidi <= 0) base.minMidi = 40;
     base.maxMidi = q.queryItemValue("max_midi").toInt();
@@ -273,7 +254,7 @@ QJsonObject runChirpTest(const QUrlQuery& q)
     base.voicedThreshold = q.queryItemValue("voiced_threshold").toFloat();
     if (base.voicedThreshold <= 0.0f) base.voicedThreshold = 0.20f;
     base.ratioSmoothing = q.queryItemValue("ratio_smoothing").toFloat();
-    if (base.ratioSmoothing <= 0.0f) base.ratioSmoothing = 0.15f;
+    if (base.ratioSmoothing <= 0.0f) base.ratioSmoothing = 1.0f;
     base.amplitudeSmoothing = q.queryItemValue("amplitude_smoothing").toFloat();
     if (base.amplitudeSmoothing <= 0.0f) base.amplitudeSmoothing = 0.15f;
     base.phasePull = q.queryItemValue("phase_pull").toFloat();
@@ -309,9 +290,18 @@ QJsonObject runChirpTest(const QUrlQuery& q)
     double tunedTargetErrHz = 0.0;
     bool pitchOk = false;
     if (std::isfinite(rawHz) && std::isfinite(tunedHz) && rawHz > 0.0 && tunedHz > 0.0) {
-        const double rawMidi = hzToMidi(rawHz);
-        const int targetMidi = nearestScaleMidiForKey(rawMidi, base.keyRoot, base.minor);
-        targetHz = midiToHz(static_cast<double>(targetMidi));
+        const auto* definition = jtune::pitchSystemRegistry().byId(base.pitchSystemId);
+        jtune::PitchContext context;
+        context.referenceMidi = base.referenceMidiNote;
+        context.referenceHz = base.baseAFrequencyHz;
+        context.octaveShift = base.octaveShift;
+        context.tonicMidi = base.tonicMidiNote;
+        const auto* collection = jtune::pitchCollectionById(base.pitchCollectionId);
+        if (collection && collection->id == "custom") context.enabledDegrees = &base.customEnabledDegrees;
+        else if (collection && definition && collection->degreeCount == static_cast<int>(definition->targets.size()))
+            context.enabledDegrees = &collection->enabledDegrees;
+        const auto evaluated = definition ? jtune::PitchSystemEvaluator(*definition).nearest(rawHz, context) : std::nullopt;
+        targetHz = evaluated ? evaluated->frequencyHz : rawHz;
         double semitones = 12.0 * std::log2(targetHz / rawHz);
         semitones = std::clamp(semitones, -6.0, 6.0);
         const double expectedRatio = std::pow(2.0, semitones / 12.0);
@@ -335,8 +325,20 @@ QJsonObject runChirpTest(const QUrlQuery& q)
 
     QJsonObject out;
     out["ok"] = ok;
-    out["key"] = QString::number(base.keyRoot);
-    out["scale"] = base.minor ? "minor" : "major";
+    out["pitch_system_id"] = QString::fromStdString(base.pitchSystemId);
+    out["pitch_collection_id"] = QString::fromStdString(base.pitchCollectionId);
+    out["tonic_midi_note"] = base.tonicMidiNote;
+    if (const auto* definition = jtune::pitchSystemRegistry().byId(base.pitchSystemId)) {
+        out["pitch_system_version"] = QString::fromStdString(definition->version);
+        out["pitch_system_source_hash"] = QString::fromStdString(definition->sourceHash);
+        out["pitch_system_scope"] = QString::fromStdString(definition->scope);
+        out["pitch_system_reviewed"] = definition->reviewed;
+        out["pitch_system_correction_eligible"] = definition->correctionEligible;
+        out["pitch_system_limitations"] = QString::fromStdString(definition->limitations);
+    }
+    out["reference_midi_note"] = base.referenceMidiNote;
+    out["reference_hz"] = base.baseAFrequencyHz;
+    out["octave_shift"] = base.octaveShift;
     out["algorithm"] = queryOr("algorithm", "loiacono");
     out["resynth"] = base.resynthMode == jtune::TimeDomain ? "TimeDomain" : "FrequencyDomain";
     out["verifier"] = "cross-over";

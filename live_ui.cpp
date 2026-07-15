@@ -1,4 +1,5 @@
 #include "autotune_core.h"
+#include "pitch_system.hpp"
 #include "pitch_tracker.h"
 
 #include "RtAudio.h"
@@ -234,7 +235,8 @@ void printDevices(RtAudio& audio)
 
 void printUsage(const char* argv0)
 {
-    std::cout << "Usage: " << argv0 << " [--key C] [--scale major|minor] [--strength 1.0]"
+    std::cout << "Usage: " << argv0 << " [--pitch-system ID] [--tuning-file FILE]"
+              << " [--reference-note 69] [--reference-hz 440] [--octave-shift -2..2] [--strength 1.0]"
               << " [--sample-rate 48000] [--buffer-frames 256] [--min-midi 40] [--max-midi 84]"
               << " [--multiple 24] [--voiced-threshold 1.1] [--bin-count 128] [--analysis-hop 256]"
               << " [--freq-min 100] [--freq-max 3000] [--algorithm loiacono|fft|goertzel]"
@@ -259,23 +261,32 @@ bool parseArgs(int argc, char** argv, RuntimeOptions& opts, bool& showHelp)
             printUsage(argv[0]);
             showHelp = true;
             return false;
-        } else if (a == "--key") {
+        } else if (a == "--pitch-system") {
+            if (!needValue(a)) return false; opts.dsp.pitchSystemId = argv[++i];
+        } else if (a == "--tuning-file") {
             if (!needValue(a)) return false;
-            const int key = parseKeyRoot(argv[++i]);
-            if (key < 0) {
-                std::cerr << "Invalid key\n";
+            std::vector<std::string> errors;
+            if (!jtune::pitchSystemRegistry().loadFile(argv[++i], errors)) {
+                for (const auto& error : errors) std::cerr << error << '\n';
                 return false;
             }
-            opts.dsp.keyRoot = key;
-        } else if (a == "--scale") {
-            if (!needValue(a)) return false;
-            std::string v = argv[++i];
-            if (v == "major") opts.dsp.minor = false;
-            else if (v == "minor") opts.dsp.minor = true;
-            else {
-                std::cerr << "Scale must be major or minor\n";
-                return false;
-            }
+            opts.dsp.pitchSystemId = jtune::pitchSystemRegistry().definitions().back().id;
+        } else if (a == "--reference-note") {
+            if (!needValue(a)) return false; opts.dsp.referenceMidiNote = std::stoi(argv[++i]);
+        } else if (a == "--reference-hz") {
+            if (!needValue(a)) return false; opts.dsp.baseAFrequencyHz = std::stod(argv[++i]);
+        } else if (a == "--octave-shift") {
+            if (!needValue(a)) return false; opts.dsp.octaveShift = std::stoi(argv[++i]);
+        } else if (a == "--pitch-collection") {
+            if (!needValue(a)) return false; opts.dsp.pitchCollectionId = argv[++i];
+        } else if (a == "--tonic-note") {
+            if (!needValue(a)) return false; opts.dsp.tonicMidiNote = std::stoi(argv[++i]);
+        } else if (a == "--degrees") {
+            if (!needValue(a)) return false; const auto values = jtune::parsePitchDegreeList(argv[++i]);
+            if (!values) return false; opts.dsp.pitchCollectionId = "custom"; opts.dsp.customEnabledDegrees = *values;
+        } else if (a == "--key" || a == "--scale") {
+            std::cerr << a << " was removed; choose an explicit pitch system and reference pitch\n";
+            return false;
         } else if (a == "--strength") {
             if (!needValue(a)) return false;
             opts.dsp.strength = std::clamp(std::stof(argv[++i]), 0.0f, 1.0f);
@@ -434,9 +445,13 @@ void renderGraph(const RuntimeOptions& opts, UiState& ui)
     std::cout << "JTune Live UI  (press q to quit)\n";
     std::cout << "input=i output=o overlap=*\n";
     std::cout << "in=" << latestIn << "Hz  out=" << latestOut << "Hz  ratio=" << ratio
-              << "  key=" << opts.dsp.keyRoot
-              << "  scale=" << (opts.dsp.minor ? "minor" : "major")
+              << "  pitch_system=" << opts.dsp.pitchSystemId
+              << "  reference=" << opts.dsp.referenceMidiNote << '@' << opts.dsp.baseAFrequencyHz << "Hz"
+              << "  octave_shift=" << opts.dsp.octaveShift
               << "  strength=" << opts.dsp.strength << "\n";
+    if (const auto* definition = jtune::pitchSystemRegistry().byId(opts.dsp.pitchSystemId))
+        std::cout << "model=" << definition->version << " hash=" << definition->sourceHash
+                  << " correction=" << (definition->correctionEligible ? "enabled" : "reference-only") << "\n";
 
     for (int y = 0; y < graphHeight; ++y) {
         const double t = 1.0 - static_cast<double>(y) / static_cast<double>(graphHeight - 1);

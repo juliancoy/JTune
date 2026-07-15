@@ -1,0 +1,66 @@
+{
+  "id": "org.jtune.ord-cc32.egypt.hijaz",
+  "version": "zenodo-15682346",
+  "display_name": "Cairo 1932 observed — hijaz / Egypt (n=4)",
+  "tradition": "1932 Cairo Congress historical performance",
+  "region": "Egypt",
+  "scope": "Tonic-aligned aggregate for recordings tagged hijaz from Egypt",
+  "model_type": "measured",
+  "period_behavior": "octave",
+  "period_ratio": 2.0,
+  "author_or_community": "ORD-CC32; Baris Bozkurt and Arthur Diniz De Souza",
+  "measurement_date": "1932 recordings; features published 2025-06-17",
+  "reviewed": false,
+  "correction_eligible": false,
+  "limitations": "Historical corpus-derived candidate, not Saudi, contemporary, universal, or a complete model of sayr/modulation. Peak centers are computational estimates from tonic-aligned histograms.",
+  "appropriate_use": "Historical Cairo-1932 comparison and cautious correction only within the matching region/maqam label.",
+  "sources": [
+    {
+      "citation": "Bozkurt (2025), ORD-CC32, 10.5281/zenodo.15682346",
+      "url": "https://doi.org/10.5281/zenodo.15682346",
+      "license": "CC BY-NC 4.0"
+    }
+  ],
+  "targets": [
+    {
+      "id": "observed-degree-1",
+      "name": "Observed center 500 cents",
+      "cents": 500.0,
+      "ratio": 1.3348398541700344,
+      "uncertainty_cents": 20.55,
+      "confidence": 0.574
+    },
+    {
+      "id": "observed-degree-2",
+      "name": "Observed center 720 cents",
+      "cents": 720.0,
+      "ratio": 1.515716566510398,
+      "uncertainty_cents": 21.08,
+      "confidence": 0.546
+    },
+    {
+      "id": "observed-degree-3",
+      "name": "Observed center 840 cents",
+      "cents": 840.0,
+      "ratio": 1.624504792712471,
+      "uncertainty_cents": 21.59,
+      "confidence": 0.416
+    },
+    {
+      "id": "observed-degree-4",
+      "name": "Observed center 1020 cents",
+      "cents": 1020.0,
+      "ratio": 1.8025009252216604,
+      "uncertainty_cents": 20.82,
+      "confidence": 0.257
+    },
+    {
+      "id": "octave",
+      "name": "Octave",
+      "cents": 1200.0,
+      "ratio": 2.0,
+      "uncertainty_cents": 10.0,
+      "confidence": 0.95
+    }
+  ]
+}

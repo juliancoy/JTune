@@ -2,6 +2,7 @@
 #include "audio_device_labels.h"
 #include "loiacono_rolling.h"
 #include "pitch_tracker.h"
+#include "pitch_system.hpp"
 
 #include "RtAudio.h"
 
@@ -11,11 +12,13 @@
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
 #include <QFormLayout>
+#include <QFileDialog>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMessageBox>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QProgressDialog>
@@ -24,8 +27,10 @@
 #include <QHostAddress>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QImage>
 #include <QCheckBox>
 #include <QSlider>
+#include <QSettings>
 #include <QSpinBox>
 #include <QSplitter>
 #include <QTabWidget>
@@ -42,6 +47,7 @@
 #include <cmath>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <limits>
@@ -49,45 +55,6 @@
 #include <vector>
 
 namespace {
-
-double hzToMidi(double hz)
-{
-    if (hz <= 0.0) return 0.0;
-    return 69.0 + 12.0 * std::log2(hz / 440.0);
-}
-
-double midiToHz(double midi)
-{
-    return 440.0 * std::pow(2.0, (midi - 69.0) / 12.0);
-}
-
-bool inScaleForKey(int midiNote, int keyRoot, bool minor)
-{
-    static const int major[7] = {0, 2, 4, 5, 7, 9, 11};
-    static const int minorScale[7] = {0, 2, 3, 5, 7, 8, 10};
-    const int pc = ((midiNote % 12) + 12) % 12;
-    const int* intervals = minor ? minorScale : major;
-    for (int i = 0; i < 7; ++i) {
-        if (((intervals[i] + keyRoot) % 12) == pc) return true;
-    }
-    return false;
-}
-
-int nearestScaleMidiForKey(double detectedMidi, int keyRoot, bool minor)
-{
-    const int center = static_cast<int>(std::lround(detectedMidi));
-    int best = center;
-    double bestDist = 1e9;
-    for (int n = center - 24; n <= center + 24; ++n) {
-        if (!inScaleForKey(n, keyRoot, minor)) continue;
-        const double d = std::abs(static_cast<double>(n) - detectedMidi);
-        if (d < bestDist) {
-            bestDist = d;
-            best = n;
-        }
-    }
-    return best;
-}
 
 QString apiName(RtAudio::Api api)
 {
@@ -537,21 +504,44 @@ public:
         : QWidget(parent)
     {
         setMinimumHeight(260);
+        setCursor(Qt::PointingHandCursor);
+        setToolTip("Click to open the dedicated pitch monitor");
+    }
+
+    void setClickHandler(std::function<void()> handler)
+    {
+        clickHandler_ = std::move(handler);
     }
 
     void setData(const std::vector<float>& in,
                  const std::vector<float>& out,
+                 const std::vector<std::vector<float>>& spectra,
+                 const std::vector<double>& expectedNoteHz,
+                 int historySize,
+                 double spectrumMinHz,
+                 double spectrumMaxHz,
                  int minMidi,
                  int maxMidi)
     {
         in_ = in;
         out_ = out;
+        spectra_ = spectra;
+        expectedNoteHz_ = expectedNoteHz;
+        historySize_ = std::max(2, historySize);
+        spectrumMinHz_ = std::max(1.0, spectrumMinHz);
+        spectrumMaxHz_ = std::max(spectrumMinHz_ * 1.01, spectrumMaxHz);
         minMidi_ = minMidi;
         maxMidi_ = std::max(minMidi + 1, maxMidi);
         update();
     }
 
 protected:
+    void mousePressEvent(QMouseEvent* event) override
+    {
+        if (event->button() == Qt::LeftButton && clickHandler_) clickHandler_();
+        QWidget::mousePressEvent(event);
+    }
+
     void paintEvent(QPaintEvent*) override
     {
         QPainter p(this);
@@ -561,32 +551,94 @@ protected:
         p.setPen(QColor(65, 75, 90));
         p.drawRect(graph);
 
-        p.setPen(QColor(45, 52, 64));
-        for (int i = 1; i < 4; ++i) {
-            const double t = static_cast<double>(i) / 4.0;
-            const double y = graph.top() + t * graph.height();
-            p.drawLine(QPointF(graph.left(), y), QPointF(graph.right(), y));
-        }
+        const double graphMinHz = expectedNoteHz_.empty()
+            ? spectrumMinHz_
+            : expectedNoteHz_.front();
+        const double graphMaxHz = std::max(graphMinHz * 1.01, expectedNoteHz_.empty()
+            ? spectrumMaxHz_
+            : expectedNoteHz_.back());
+        const double graphLogMin = std::log(std::max(1.0e-6, graphMinHz));
+        const double graphLogSpan = std::max(1.0e-9, std::log(graphMaxHz) - graphLogMin);
+        auto frequencyY = [&](double hz) {
+            const double t = std::clamp(
+                (std::log(std::max(1.0e-6, hz)) - graphLogMin) / graphLogSpan, 0.0, 1.0);
+            return graph.bottom() - t * graph.height();
+        };
 
         auto mapY = [&](float hz) {
             if (hz <= 0.0f) return std::numeric_limits<double>::quiet_NaN();
-            const double midi = hzToMidi(hz);
-            const double t = std::clamp((midi - static_cast<double>(minMidi_)) /
-                                        static_cast<double>(maxMidi_ - minMidi_),
-                                        0.0,
-                                        1.0);
-            return graph.bottom() - t * graph.height();
+            return frequencyY(hz);
         };
+
+        if (!spectra_.empty() && graph.width() > 1.0 && graph.height() > 1.0) {
+            const int imageHeight = std::max(1, static_cast<int>(std::lround(graph.height())));
+            QImage spectrogram(historySize_, imageHeight, QImage::Format_ARGB32);
+            spectrogram.fill(QColor(18, 22, 28));
+            float peak = 0.0f;
+            for (const auto& column : spectra_) {
+                for (float amplitude : column) peak = std::max(peak, amplitude);
+            }
+            peak = std::max(peak, 1.0e-9f);
+            const size_t visibleSize = std::min(spectra_.size(), static_cast<size_t>(historySize_));
+            const size_t first = spectra_.size() - visibleSize;
+            const int firstSlot = historySize_ - static_cast<int>(visibleSize);
+            const double logMin = std::log(spectrumMinHz_);
+            const double logSpan = std::log(spectrumMaxHz_) - logMin;
+            auto colorFor = [&](float amplitude) {
+                float t = std::log1p(9.0f * std::max(0.0f, amplitude) / peak) / std::log(10.0f);
+                t = t < 0.05f ? 0.0f : std::pow(t, 0.6f);
+                const float r = std::clamp(1.5f * t - 0.5f, 0.0f, 1.0f);
+                const float g = std::clamp(1.5f - std::abs(3.0f * t - 1.5f), 0.0f, 1.0f);
+                const float b = std::clamp(1.0f - 1.5f * t, 0.0f, 1.0f);
+                return qRgba(static_cast<int>(255.0f * r), static_cast<int>(255.0f * g),
+                             static_cast<int>(255.0f * b), 220);
+            };
+            for (size_t i = first; i < spectra_.size(); ++i) {
+                const auto& column = spectra_[i];
+                if (column.empty()) continue;
+                const int x = firstSlot + static_cast<int>(i - first);
+                for (int y = 0; y < imageHeight; ++y) {
+                    const double graphT = 1.0 -
+                        static_cast<double>(y) / std::max(1, imageHeight - 1);
+                    const double hz = std::exp(graphLogMin + graphT * graphLogSpan);
+                    if (hz < spectrumMinHz_ || hz > spectrumMaxHz_) continue;
+                    const double binT = (std::log(hz) - logMin) / logSpan;
+                    const size_t bin = static_cast<size_t>(std::clamp(
+                        std::lround(binT * static_cast<double>(column.size() - 1)),
+                        0L, static_cast<long>(column.size() - 1)));
+                    spectrogram.setPixel(x, y, colorFor(column[bin]));
+                }
+            }
+            p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+            p.drawImage(graph, spectrogram);
+        }
+
+        // Draw the evaluated targets of the selected tuning system. A measured
+        // pitch on target lands exactly on its guide, including low registers.
+        for (double expectedHz : expectedNoteHz_) {
+            const double y = frequencyY(expectedHz);
+            p.setPen(QColor(75, 85, 102, 190));
+            p.drawLine(QPointF(graph.left(), y), QPointF(graph.right(), y));
+        }
+        p.setPen(QColor(90, 100, 118));
+        p.drawRect(graph);
 
         auto drawSeries = [&](const std::vector<float>& v, const QColor& c) {
             if (v.size() < 2) return;
             QPainterPath path;
             bool hasStarted = false;
-            for (size_t i = 0; i < v.size(); ++i) {
+            const size_t visibleSize = std::min(v.size(), static_cast<size_t>(historySize_));
+            const size_t first = v.size() - visibleSize;
+            const double firstSlot = static_cast<double>(historySize_ - static_cast<int>(visibleSize));
+            for (size_t i = first; i < v.size(); ++i) {
                 const double y = mapY(v[i]);
-                if (!std::isfinite(y)) continue;
+                if (!std::isfinite(y)) {
+                    hasStarted = false;
+                    continue;
+                }
+                const double slot = firstSlot + static_cast<double>(i - first);
                 const double x = graph.left() +
-                    (static_cast<double>(i) / static_cast<double>(std::max<size_t>(1, v.size() - 1))) * graph.width();
+                    (slot / static_cast<double>(historySize_ - 1)) * graph.width();
                 if (!hasStarted) {
                     path.moveTo(x, y);
                     hasStarted = true;
@@ -594,28 +646,43 @@ protected:
                     path.lineTo(x, y);
                 }
             }
-            p.setPen(QPen(c, 1.8));
+            p.setRenderHint(QPainter::Antialiasing, true);
+            p.setPen(QPen(c, 3.0));
             p.drawPath(path);
+            if (hasStarted) {
+                const double y = mapY(v.back());
+                if (std::isfinite(y)) {
+                    p.setPen(QPen(QColor(18, 22, 28), 2.0));
+                    p.setBrush(c);
+                    p.drawEllipse(QPointF(graph.right(), y), 5.0, 5.0);
+                }
+            }
         };
 
         drawSeries(in_, QColor(79, 195, 247));
         drawSeries(out_, QColor(255, 167, 38));
 
         p.setPen(QColor(210, 220, 235));
-        p.drawText(QPointF(10, graph.top() + 6), QString::number(maxMidi_));
-        p.drawText(QPointF(10, graph.bottom() + 4), QString::number(minMidi_));
+        p.drawText(QPointF(2, graph.top() + 6), QString("%1 Hz").arg(graphMaxHz, 0, 'f', 1));
+        p.drawText(QPointF(2, graph.bottom() + 4), QString("%1 Hz").arg(graphMinHz, 0, 'f', 1));
 
         p.setPen(QColor(79, 195, 247));
         p.drawText(QPointF(graph.left(), height() - 8), "Input pitch");
         p.setPen(QColor(255, 167, 38));
-        p.drawText(QPointF(graph.left() + 95, height() - 8), "Output pitch");
+        p.drawText(QPointF(graph.left() + 95, height() - 8), "Measured output pitch");
     }
 
 private:
     std::vector<float> in_;
     std::vector<float> out_;
+    std::vector<std::vector<float>> spectra_;
+    std::vector<double> expectedNoteHz_;
+    int historySize_ = 500;
+    double spectrumMinHz_ = 100.0;
+    double spectrumMaxHz_ = 3000.0;
     int minMidi_ = 40;
     int maxMidi_ = 84;
+    std::function<void()> clickHandler_;
 };
 
 class AudioEngine {
@@ -667,9 +734,12 @@ public:
 
             const int trackerBins = std::clamp(settings.dsp.binCount / 2, 48, 160);
             const int trackerHop = std::max(settings.dsp.analysisHop * 2, 192);
+            constexpr unsigned int trackerDecimation = 4;
+            const unsigned int trackerSampleRate =
+                std::max(1u, settings.dsp.sampleRate / trackerDecimation);
             st->inTracker = std::make_unique<jtune::RollingPitchTracker>(
                 jtune::PitchTrackerOptions{
-                    settings.dsp.sampleRate,
+                    trackerSampleRate,
                     settings.dsp.minMidi,
                     settings.dsp.maxMidi,
                     settings.dsp.multiple,
@@ -687,7 +757,7 @@ public:
                     settings.dsp.algorithmMode});
             st->outTracker = std::make_unique<jtune::RollingPitchTracker>(
                 jtune::PitchTrackerOptions{
-                    settings.dsp.sampleRate,
+                    trackerSampleRate,
                     settings.dsp.minMidi,
                     settings.dsp.maxMidi,
                     settings.dsp.multiple,
@@ -703,8 +773,7 @@ public:
                     settings.dsp.normalizationMode,
                     settings.dsp.windowLengthMode,
                     settings.dsp.algorithmMode});
-            st->passthrough = settings.dsp.strength <= 1e-6f;
-
+            st->trackerDecimation = static_cast<int>(trackerDecimation);
             RtAudio::StreamParameters input;
             RtAudio::StreamParameters output;
             input.deviceId = settings.inputDevice;
@@ -774,6 +843,10 @@ public:
     struct Snapshot {
         std::vector<float> in;
         std::vector<float> out;
+        std::vector<std::vector<float>> spectra;
+        int historySize = 500;
+        double spectrumMinHz = 100.0;
+        double spectrumMaxHz = 3000.0;
         float inHz = 0.0f;
         float outHz = 0.0f;
         float ratio = 1.0f;
@@ -785,8 +858,13 @@ public:
         Snapshot snap;
         std::lock_guard<std::mutex> lock(mutex_);
         if (!state_) return snap;
+        std::lock_guard<std::mutex> dataLock(state_->dataMutex);
         snap.in.assign(state_->inHistory.begin(), state_->inHistory.end());
         snap.out.assign(state_->outHistory.begin(), state_->outHistory.end());
+        snap.spectra.assign(state_->spectrumHistory.begin(), state_->spectrumHistory.end());
+        snap.historySize = state_->historyLimit;
+        snap.spectrumMinHz = state_->settings.dsp.freqMinHz;
+        snap.spectrumMaxHz = state_->settings.dsp.freqMaxHz;
         snap.inHz = state_->latestInHz;
         snap.outHz = state_->latestOutHz;
         snap.ratio = state_->latestRatio;
@@ -800,12 +878,12 @@ private:
         std::unique_ptr<jtune::ConstantQAutotuneProcessor> processor;
         std::unique_ptr<jtune::RollingPitchTracker> inTracker;
         std::unique_ptr<jtune::RollingPitchTracker> outTracker;
-        bool passthrough = false;
         int trackerCounter = 0;
         int trackerDecimation = 4;
 
         std::deque<float> inHistory;
         std::deque<float> outHistory;
+        std::deque<std::vector<float>> spectrumHistory;
         int historyLimit = 400;
 
         float latestInHz = 0.0f;
@@ -842,23 +920,23 @@ private:
             if (st->trackerCounter >= st->trackerDecimation) {
                 st->trackerCounter = 0;
                 const bool inUpdated = st->inTracker->processSample(sIn);
-                bool outUpdated = false;
-                if (st->passthrough) {
-                    outUpdated = inUpdated;
-                } else {
-                    outUpdated = st->outTracker->processSample(sOut);
-                }
+                // Always measure the samples sent to the output device. Even
+                // passthrough can differ because of the active wet/dry and
+                // synthesis path, so deriving this from input is misleading.
+                const bool outUpdated = st->outTracker->processSample(sOut);
                 if (inUpdated || outUpdated) {
+                    std::vector<float> spectrum;
+                    st->processor->copyCurrentSpectrum(spectrum);
                     std::lock_guard<std::mutex> lock(st->dataMutex);
                     st->latestInHz = static_cast<float>(st->inTracker->pitchHz());
-                    st->latestOutHz = st->passthrough
-                        ? st->latestInHz
-                        : static_cast<float>(st->outTracker->pitchHz());
+                    st->latestOutHz = static_cast<float>(st->outTracker->pitchHz());
                     st->latestRatio = st->processor->currentPitchRatio();
                     st->inHistory.push_back(st->latestInHz);
                     st->outHistory.push_back(st->latestOutHz);
+                    st->spectrumHistory.push_back(std::move(spectrum));
                     while (static_cast<int>(st->inHistory.size()) > st->historyLimit) st->inHistory.pop_front();
                     while (static_cast<int>(st->outHistory.size()) > st->historyLimit) st->outHistory.pop_front();
+                    while (static_cast<int>(st->spectrumHistory.size()) > st->historyLimit) st->spectrumHistory.pop_front();
                 }
             }
         }
@@ -898,19 +976,157 @@ public:
         inputCombo_ = new QComboBox;
         outputCombo_ = new QComboBox;
 
-        keyCombo_ = new QComboBox;
-        for (const QString& k : {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"}) {
-            keyCombo_->addItem(k);
-        }
         profileCombo_ = new QComboBox;
         profileCombo_->addItem("Balanced");
         profileCombo_->addItem("Low Notes Stable");
         profileCombo_->addItem("Low Notes Aggressive");
         profileCombo_->addItem("High Notes Fast");
 
-        scaleCombo_ = new QComboBox;
-        scaleCombo_->addItem("major");
-        scaleCombo_->addItem("minor");
+        tuningCombo_ = new QComboBox;
+        const auto& pitchSystems = jtune::pitchSystemRegistry().definitions();
+        for (int i = 0; i < static_cast<int>(pitchSystems.size()); ++i)
+            tuningCombo_->addItem(QString::fromStdString(pitchSystems[static_cast<size_t>(i)].displayName),
+                                  QString::fromStdString(pitchSystems[static_cast<size_t>(i)].id));
+        collectionCombo_ = new QComboBox;
+        for (const auto& collection : jtune::builtInPitchCollections())
+            collectionCombo_->addItem(QString::fromStdString(collection.displayName),
+                                      QString::fromStdString(collection.id));
+        tonicNoteCombo_ = new QComboBox;
+        static const char* tonicNames[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+        for (int midi = 0; midi < 128; ++midi)
+            tonicNoteCombo_->addItem(QStringLiteral("%1%2 (MIDI %3)")
+                .arg(tonicNames[midi % 12]).arg(midi / 12 - 1).arg(midi), midi);
+        tonicNoteCombo_->setCurrentIndex(60);
+        auto* editDegreesButton = new QPushButton("Edit active degrees");
+        connect(editDegreesButton, &QPushButton::clicked, this, [this]() {
+            const auto* definition = jtune::pitchSystemRegistry().byId(
+                tuningCombo_->currentData().toString().toStdString());
+            if (!definition) return;
+            QDialog dialog(this);
+            dialog.setWindowTitle("Active correction targets");
+            auto* layout = new QVBoxLayout(&dialog);
+            layout->addWidget(new QLabel("Degree offsets from tonic; the tuning system is unchanged."));
+            std::vector<QCheckBox*> checks;
+            for (size_t degree = 0; degree < definition->targets.size(); ++degree) {
+                const QString name = degree == 0 ? "0 — tonic / 1:1"
+                    : QString("%1 — %2").arg(degree).arg(QString::fromStdString(definition->targets[degree - 1].name));
+                auto* check = new QCheckBox(name);
+                check->setChecked(std::find(customEnabledDegrees_.begin(), customEnabledDegrees_.end(),
+                    static_cast<int>(degree)) != customEnabledDegrees_.end());
+                checks.push_back(check);
+                layout->addWidget(check);
+            }
+            auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+            connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+            connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+            layout->addWidget(buttons);
+            if (dialog.exec() != QDialog::Accepted) return;
+            customEnabledDegrees_.clear();
+            for (size_t i = 0; i < checks.size(); ++i)
+                if (checks[i]->isChecked()) customEnabledDegrees_.push_back(static_cast<int>(i));
+            collectionCombo_->setCurrentIndex(collectionCombo_->findData("custom"));
+            QVariantList saved;
+            for (int degree : customEnabledDegrees_) saved << degree;
+            QSettings("JTune", "JTune").setValue("pitch_collection/custom_degrees", saved);
+        });
+        auto* importPitchSystemButton = new QPushButton("Import .scl/.json");
+        auto* pitchSystemDetailsButton = new QPushButton("Details");
+        connect(importPitchSystemButton, &QPushButton::clicked, this, [this]() {
+            const QStringList paths = QFileDialog::getOpenFileNames(
+                this, "Import Pitch Systems", QString(), "Pitch systems (*.scl *.json)");
+            if (paths.isEmpty()) return;
+            QStringList failures;
+            QString lastImportedPath;
+            for (const QString& path : paths) {
+                std::vector<std::string> errors;
+                if (!jtune::pitchSystemRegistry().loadFile(path.toStdString(), errors)) {
+                    for (const auto& error : errors)
+                        failures << QString("%1: %2").arg(path, QString::fromStdString(error));
+                    continue;
+                }
+                const auto& definition = jtune::pitchSystemRegistry().definitions().back();
+                tuningCombo_->addItem(QString::fromStdString(definition.displayName),
+                                      QString::fromStdString(definition.id));
+                lastImportedPath = path;
+            }
+            if (lastImportedPath.isEmpty()) {
+                QMessageBox::critical(this, "Pitch System Import Failed", failures.join('\n'));
+                return;
+            }
+            tuningCombo_->setCurrentIndex(tuningCombo_->count() - 1);
+            QSettings settings("JTune", "JTune");
+            settings.setValue("pitch_system/file", lastImportedPath);
+            settings.setValue("pitch_system/id", tuningCombo_->currentData().toString());
+            if (!failures.isEmpty())
+                QMessageBox::warning(this, "Some Pitch Systems Were Not Imported", failures.join('\n'));
+        });
+        connect(tuningCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+            const auto* definition = jtune::pitchSystemRegistry().byIndex(index);
+            if (!definition) return;
+            tuningCombo_->setToolTip(QString::fromStdString(
+                definition->scope + "\nCorrection: " +
+                (definition->correctionEligible ? "enabled" : "disabled (reference only)") +
+                "\nUse: " + definition->appropriateUse + "\nLimits: " + definition->limitations));
+            const QString previous = collectionCombo_->currentData().toString();
+            collectionCombo_->clear();
+            for (const auto& collection : jtune::builtInPitchCollections()) {
+                if (collection.degreeCount != 0 &&
+                    collection.degreeCount != static_cast<int>(definition->targets.size())) continue;
+                collectionCombo_->addItem(QString::fromStdString(collection.displayName),
+                                          QString::fromStdString(collection.id));
+            }
+            const int restored = collectionCombo_->findData(previous);
+            collectionCombo_->setCurrentIndex(restored >= 0 ? restored : 0);
+        });
+        connect(pitchSystemDetailsButton, &QPushButton::clicked, this, [this]() {
+            const auto* definition = jtune::pitchSystemRegistry().byId(tuningCombo_->currentData().toString().toStdString());
+            if (!definition) return;
+            QString details = QString("ID: %1\nVersion: %2\nModel: %3\nTradition: %4\nRegion/locality: %5 / %6\nScope: %7\nAuthor/community: %8\nEnsemble: %9\nInstrument: %10\nReviewed: %11\n\nAppropriate use: %12\n\nLimitations: %13\n\nSources:\n")
+                .arg(QString::fromStdString(definition->id), QString::fromStdString(definition->version))
+                .arg(static_cast<int>(definition->modelType))
+                .arg(QString::fromStdString(definition->tradition), QString::fromStdString(definition->region),
+                     QString::fromStdString(definition->locality), QString::fromStdString(definition->scope),
+                     QString::fromStdString(definition->authorOrCommunity), QString::fromStdString(definition->ensemble),
+                     QString::fromStdString(definition->instrument))
+                .arg(definition->reviewed ? "yes" : "no")
+                .arg(QString::fromStdString(definition->appropriateUse), QString::fromStdString(definition->limitations));
+            details.prepend(QString("Correction eligible: %1\n").arg(
+                definition->correctionEligible ? "yes" : "no — visualization/reference only"));
+            details += QString("\nSource hash: %1\nCorrection range: %2 cents\nReviews:\n")
+                .arg(QString::fromStdString(definition->sourceHash))
+                .arg(definition->correctionRangeCents > 0.0 ? definition->correctionRangeCents : 200.0);
+            for (const auto& review : definition->reviews)
+                details += QString("• %1 — %2 (%3)\n  %4\n")
+                    .arg(QString::fromStdString(review.reviewer),
+                         QString::fromStdString(review.scope), QString::fromStdString(review.date),
+                         QString::fromStdString(review.evidenceUrl));
+            details += "\nTargets:\n";
+            for (const auto& target : definition->targets) {
+                details += QString("• %1 [%2] ratio=%3 cents=%4 Hz=%5 uncertainty=±%6c confidence=%7 direction=%8 register=%9..%10 paired=%11 beat=%12Hz\n")
+                    .arg(QString::fromStdString(target.name), QString::fromStdString(target.id))
+                    .arg(target.ratio, 0, 'g', 10).arg(target.cents, 0, 'f', 3)
+                    .arg(target.absoluteHz, 0, 'f', 3).arg(target.uncertaintyCents, 0, 'f', 2)
+                    .arg(target.confidence, 0, 'f', 3).arg(static_cast<int>(target.direction))
+                    .arg(target.registerMin).arg(target.registerMax)
+                    .arg(QString::fromStdString(target.pairedTargetId)).arg(target.beatRateHz, 0, 'f', 3);
+            }
+            for (const auto& source : definition->sources)
+                details += QString("• %1\n  %2\n  License: %3\n").arg(QString::fromStdString(source.citation),
+                    QString::fromStdString(source.url), QString::fromStdString(source.license));
+            QMessageBox::information(this, "Pitch System Provenance", details);
+        });
+        referenceNoteCombo_ = new QComboBox;
+        static const char* noteNames[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+        for (int midi = 0; midi < 128; ++midi) {
+            const QString label = QStringLiteral("%1%2 (MIDI %3)")
+                .arg(noteNames[midi % 12]).arg(midi / 12 - 1).arg(midi);
+            referenceNoteCombo_->addItem(label, midi);
+        }
+        referenceNoteCombo_->setCurrentIndex(69);
+        octaveShiftSpin_ = new QSpinBox;
+        octaveShiftSpin_->setRange(-2, 2);
+        octaveShiftSpin_->setValue(0);
+        octaveShiftSpin_->setSuffix(" oct");
 
         strengthSlider_ = new QSlider(Qt::Horizontal);
         strengthSlider_->setRange(0, 100);
@@ -966,7 +1182,7 @@ public:
         leakinessSpin_->setValue(advanced_.leakiness);
 
         baseASpin_ = new QDoubleSpinBox;
-        baseASpin_->setRange(400.0, 500.0);
+        baseASpin_->setRange(1.0, 20000.0);
         baseASpin_->setDecimals(2);
         baseASpin_->setSingleStep(0.5);
         baseASpin_->setValue(advanced_.baseA);
@@ -1024,6 +1240,8 @@ public:
         ratioSmoothingSpin_->setRange(0.01, 1.0);
         ratioSmoothingSpin_->setDecimals(3);
         ratioSmoothingSpin_->setSingleStep(0.01);
+        // A short correction glide is the normal musical behavior. The hard
+        // tune profile can still select 1.0 for an instantaneous note lock.
         ratioSmoothingSpin_->setValue(0.15);
 
         amplitudeSmoothingSpin_ = new QDoubleSpinBox;
@@ -1091,13 +1309,32 @@ public:
         grid->addWidget(outputCombo_, r, 4, 1, 2);
 
         r++;
-        grid->addWidget(new QLabel("Key"), r, 0);
-        grid->addWidget(keyCombo_, r, 1);
-        grid->addWidget(new QLabel("Scale"), r, 2);
-        grid->addWidget(scaleCombo_, r, 3);
+        grid->addWidget(new QLabel("Reference Note"), r, 0);
+        grid->addWidget(referenceNoteCombo_, r, 1, 1, 3);
         grid->addWidget(new QLabel("Profile"), r, 4);
         grid->addWidget(profileCombo_, r, 5);
         grid->addWidget(advancedToggleButton_, r, 6, 1, 2);
+
+        r++;
+        grid->addWidget(new QLabel("Pitch System"), r, 0);
+        grid->addWidget(tuningCombo_, r, 1, 1, 5);
+        grid->addWidget(new QLabel("Octave Shift"), r, 6);
+        grid->addWidget(octaveShiftSpin_, r, 7);
+        grid->addWidget(importPitchSystemButton, r, 8);
+        grid->addWidget(pitchSystemDetailsButton, r, 9);
+
+        r++;
+        grid->addWidget(new QLabel("Pitch Collection"), r, 0);
+        grid->addWidget(collectionCombo_, r, 1, 1, 2);
+        grid->addWidget(new QLabel("Tonic"), r, 3);
+        grid->addWidget(tonicNoteCombo_, r, 4, 1, 2);
+        grid->addWidget(editDegreesButton, r, 6, 1, 2);
+
+        r++;
+        auto* tuningPolicyLabel = new QLabel(
+            "Only mathematically exact systems are built in. Gamelan, makam, and raga require a named measured or theoretical dataset.");
+        tuningPolicyLabel->setWordWrap(true);
+        grid->addWidget(tuningPolicyLabel, r, 0, 1, 7);
 
         r++;
         grid->addWidget(new QLabel("Strength"), r, 0);
@@ -1141,6 +1378,7 @@ public:
         leftRoot->addWidget(pitchLabel_);
 
         graph_ = new PitchHistoryWidget;
+        graph_->setClickHandler([this]() { showPitchMonitor(); });
         leftRoot->addWidget(graph_, 1);
 
         advancedTabs_ = new QTabWidget;
@@ -1149,7 +1387,7 @@ public:
         pitchForm->addRow("Multiple", multipleSpin_);
         pitchForm->addRow("Freq Min", freqMinSpin_);
         pitchForm->addRow("Freq Max", freqMaxSpin_);
-        pitchForm->addRow("Base A", baseASpin_);
+        pitchForm->addRow("Reference frequency (Hz)", baseASpin_);
         pitchForm->addRow("Leakiness", leakinessSpin_);
         pitchForm->addRow("Buffer Count", bufferCountSpin_);
 
@@ -1162,7 +1400,7 @@ public:
 
         auto* synthesisTab = new QWidget;
         auto* synthesisForm = new QFormLayout(synthesisTab);
-        synthesisForm->addRow("Ratio Smooth", ratioSmoothingSpin_);
+        synthesisForm->addRow("Note glide", ratioSmoothingSpin_);
         synthesisForm->addRow("Amp Smooth", amplitudeSmoothingSpin_);
         synthesisForm->addRow("Phase Pull", phasePullSpin_);
         synthesisForm->addRow("Flow Grain (ms)", flowGrainMsSpin_);
@@ -1252,6 +1490,61 @@ public:
                 voicedThresholdSpin_->setValue(0.24);
                 ratioSmoothingSpin_->setValue(0.22);
             }
+        });
+
+        QSettings savedSettings("JTune", "JTune");
+        const QString savedFile = savedSettings.value("pitch_system/file").toString();
+        bool savedDefinitionChanged = false;
+        if (!savedFile.isEmpty()) {
+            std::vector<std::string> errors;
+            if (jtune::pitchSystemRegistry().loadFile(savedFile.toStdString(), errors)) {
+                const auto& definition = jtune::pitchSystemRegistry().definitions().back();
+                if (tuningCombo_->findData(QString::fromStdString(definition.id)) < 0)
+                    tuningCombo_->addItem(QString::fromStdString(definition.displayName), QString::fromStdString(definition.id));
+                const QString savedVersion = savedSettings.value("pitch_system/version").toString();
+                const QString savedHash = savedSettings.value("pitch_system/source_hash").toString();
+                savedDefinitionChanged = (!savedVersion.isEmpty() && savedVersion != QString::fromStdString(definition.version)) ||
+                    (!savedHash.isEmpty() && savedHash != QString::fromStdString(definition.sourceHash));
+            }
+        }
+        if (savedDefinitionChanged)
+            QMessageBox::warning(this, "Pitch System Changed",
+                "The saved pitch-system file no longer matches its recorded version/hash. "
+                "JTune selected 12-EDO instead; inspect and explicitly select the changed definition to use it.");
+        const int savedPitchSystem = tuningCombo_->findData(savedDefinitionChanged
+            ? QVariant("org.jtune.edo.12") : savedSettings.value("pitch_system/id", "org.jtune.edo.12"));
+        if (savedPitchSystem >= 0) tuningCombo_->setCurrentIndex(savedPitchSystem);
+        referenceNoteCombo_->setCurrentIndex(std::clamp(savedSettings.value("pitch_system/reference_midi", 69).toInt(), 0, 127));
+        tonicNoteCombo_->setCurrentIndex(std::clamp(savedSettings.value("pitch_collection/tonic_midi", 60).toInt(), 0, 127));
+        const int savedCollection = collectionCombo_->findData(savedSettings.value("pitch_collection/id", "all"));
+        if (savedCollection >= 0) collectionCombo_->setCurrentIndex(savedCollection);
+        for (const QVariant& degree : savedSettings.value("pitch_collection/custom_degrees").toList())
+            customEnabledDegrees_.push_back(degree.toInt());
+        baseASpin_->setValue(savedSettings.value("pitch_system/reference_hz", 440.0).toDouble());
+        octaveShiftSpin_->setValue(std::clamp(savedSettings.value("pitch_system/octave_shift", 0).toInt(), -2, 2));
+        connect(tuningCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+            QSettings settings("JTune", "JTune");
+            settings.setValue("pitch_system/id", tuningCombo_->currentData().toString());
+            const auto* definition = jtune::pitchSystemRegistry().byId(tuningCombo_->currentData().toString().toStdString());
+            if (definition) {
+                settings.setValue("pitch_system/version", QString::fromStdString(definition->version));
+                settings.setValue("pitch_system/source_hash", QString::fromStdString(definition->sourceHash));
+            }
+        });
+        connect(referenceNoteCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+            QSettings("JTune", "JTune").setValue("pitch_system/reference_midi", referenceNoteCombo_->currentData());
+        });
+        connect(collectionCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+            QSettings("JTune", "JTune").setValue("pitch_collection/id", collectionCombo_->currentData());
+        });
+        connect(tonicNoteCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+            QSettings("JTune", "JTune").setValue("pitch_collection/tonic_midi", tonicNoteCombo_->currentData());
+        });
+        connect(baseASpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [](double value) {
+            QSettings("JTune", "JTune").setValue("pitch_system/reference_hz", value);
+        });
+        connect(octaveShiftSpin_, QOverload<int>::of(&QSpinBox::valueChanged), this, [](int value) {
+            QSettings("JTune", "JTune").setValue("pitch_system/octave_shift", value);
         });
 
         timer_ = new QTimer(this);
@@ -1356,8 +1649,12 @@ private:
         s.historySize = 500;
 
         s.dsp.sampleRate = static_cast<unsigned int>(advanced_.sampleRate);
-        s.dsp.keyRoot = keyCombo_->currentIndex();
-        s.dsp.minor = (scaleCombo_->currentText() == "minor");
+        s.dsp.pitchSystemId = tuningCombo_->currentData().toString().toStdString();
+        s.dsp.pitchCollectionId = collectionCombo_->currentData().toString().toStdString();
+        s.dsp.tonicMidiNote = tonicNoteCombo_->currentData().toInt();
+        s.dsp.customEnabledDegrees = customEnabledDegrees_;
+        s.dsp.referenceMidiNote = referenceNoteCombo_->currentData().toInt();
+        s.dsp.octaveShift = octaveShiftSpin_->value();
         s.dsp.strength = static_cast<float>(strengthSlider_->value()) / 100.0f;
         s.dsp.wetMix = static_cast<float>(wetDrySlider_->value()) / 100.0f;
         s.dsp.minMidi = minMidiSpin_->value();
@@ -1425,19 +1722,18 @@ private:
         const QString summary = QString(
             "Algorithm: %1\n"
             "Verifier algos: %2\n"
-            "Key/scale: %3 %4\n"
-            "Sample rate: %5 Hz\n"
-            "Pitch shift: %6 Hz (raw=%7, tuned=%8)\n"
-            "Expected shift: %9 Hz (target=%10)\n"
-            "Target error raw/tuned: %11 / %12 Hz\n"
-            "Passthrough corr: %13\n"
-            "Passthrough rmse: %14\n"
-            "Passthrough max abs err: %15\n"
-            "Result: %16")
+            "Pitch system: %3\n"
+            "Sample rate: %4 Hz\n"
+            "Pitch shift: %5 Hz (raw=%6, tuned=%7)\n"
+            "Expected shift: %8 Hz (target=%9)\n"
+            "Target error raw/tuned: %10 / %11 Hz\n"
+            "Passthrough corr: %12\n"
+            "Passthrough rmse: %13\n"
+            "Passthrough max abs err: %14\n"
+            "Result: %15")
             .arg(algorithmName(base.algorithmMode))
             .arg(result.verifierAlgorithms.isEmpty() ? "fallback-self" : result.verifierAlgorithms)
-            .arg(keyCombo_->currentText())
-            .arg(scaleCombo_->currentText())
+            .arg(QString::fromStdString(base.pitchSystemId))
             .arg(base.sampleRate)
             .arg(QString::number(result.shiftHz, 'f', 2))
             .arg(QString::number(result.rawHz, 'f', 2))
@@ -1463,8 +1759,12 @@ private:
     {
         jtune::AutotuneOptions base;
         base.sampleRate = static_cast<unsigned int>(sampleRateSpin_->value());
-        base.keyRoot = keyCombo_->currentIndex();
-        base.minor = (scaleCombo_->currentText() == "minor");
+        base.pitchSystemId = tuningCombo_->currentData().toString().toStdString();
+        base.pitchCollectionId = collectionCombo_->currentData().toString().toStdString();
+        base.tonicMidiNote = tonicNoteCombo_->currentData().toInt();
+        base.customEnabledDegrees = customEnabledDegrees_;
+        base.referenceMidiNote = referenceNoteCombo_->currentData().toInt();
+        base.octaveShift = octaveShiftSpin_->value();
         base.minMidi = minMidiSpin_->value();
         base.maxMidi = maxMidiSpin_->value();
         base.multiple = multipleSpin_->value();
@@ -1513,11 +1813,21 @@ private:
         result.maxAbsErr = passMetrics.maxAbsErr;
 
         if (std::isfinite(result.rawHz) && std::isfinite(result.tunedHz) && result.rawHz > 0.0 && result.tunedHz > 0.0) {
-            const double rawMidi = hzToMidi(result.rawHz);
-            const int targetMidi = nearestScaleMidiForKey(rawMidi, base.keyRoot, base.minor);
-            result.targetHz = midiToHz(static_cast<double>(targetMidi));
+            const auto* definition = jtune::pitchSystemRegistry().byId(base.pitchSystemId);
+            jtune::PitchContext context;
+            context.referenceMidi = base.referenceMidiNote;
+            context.referenceHz = base.baseAFrequencyHz;
+            context.octaveShift = base.octaveShift;
+            context.tonicMidi = base.tonicMidiNote;
+            const auto* collection = jtune::pitchCollectionById(base.pitchCollectionId);
+            if (collection && collection->id == "custom") context.enabledDegrees = &base.customEnabledDegrees;
+            else if (collection && definition && collection->degreeCount == static_cast<int>(definition->targets.size()))
+                context.enabledDegrees = &collection->enabledDegrees;
+            const auto evaluated = definition ? jtune::PitchSystemEvaluator(*definition).nearest(result.rawHz, context) : std::nullopt;
+            result.targetHz = evaluated ? evaluated->frequencyHz : result.rawHz;
             double semitones = 12.0 * std::log2(result.targetHz / result.rawHz);
-            semitones = std::clamp(semitones, -6.0, 6.0);
+            const double maxShift = 6.0 + 12.0 * std::abs(base.octaveShift);
+            semitones = std::clamp(semitones, -maxShift, maxShift);
             const double expectedRatio = std::pow(2.0, semitones / 12.0);
             result.expectedShiftHz = result.rawHz * expectedRatio - result.rawHz;
             result.rawTargetErrHz = std::abs(result.rawHz - result.targetHz);
@@ -1571,18 +1881,28 @@ private:
 
     QJsonObject currentConfigJson() const
     {
+        QJsonObject pitch{{"pitch_system_id", tuningCombo_->currentData().toString()},
+            {"pitch_collection_id", collectionCombo_->currentData().toString()},
+            {"tonic_midi_note", tonicNoteCombo_->currentData().toInt()},
+            {"reference_midi_note", referenceNoteCombo_->currentData().toInt()},
+            {"octave_shift", octaveShiftSpin_->value()}, {"min_midi", minMidiSpin_->value()},
+            {"max_midi", maxMidiSpin_->value()}};
+        if (const auto* definition = jtune::pitchSystemRegistry().byId(
+                tuningCombo_->currentData().toString().toStdString())) {
+            pitch["version"] = QString::fromStdString(definition->version);
+            pitch["source_hash"] = QString::fromStdString(definition->sourceHash);
+            pitch["scope"] = QString::fromStdString(definition->scope);
+            pitch["reviewed"] = definition->reviewed;
+            pitch["correction_eligible"] = definition->correctionEligible;
+            pitch["limitations"] = QString::fromStdString(definition->limitations);
+        }
         return QJsonObject{
             {"audio", QJsonObject{
                 {"sample_rate", sampleRateSpin_->value()},
                 {"buffer_frames", bufferSpin_->value()},
                 {"buffer_count", bufferCountSpin_->value()}
             }},
-            {"pitch", QJsonObject{
-                {"key", keyCombo_->currentText()},
-                {"scale", scaleCombo_->currentText()},
-                {"min_midi", minMidiSpin_->value()},
-                {"max_midi", maxMidiSpin_->value()}
-            }},
+            {"pitch", pitch},
             {"dsp", QJsonObject{
                 {"strength", static_cast<double>(strengthSlider_->value()) / 100.0},
                 {"wet", static_cast<double>(wetDrySlider_->value()) / 100.0},
@@ -1678,16 +1998,6 @@ private:
             if (ok) wetDrySlider_->setValue(static_cast<int>(std::lround(std::clamp(v, 0.0, 1.0) * 100.0)));
         }
 
-        if (q.hasQueryItem("key")) {
-            const QString k = q.queryItemValue("key").trimmed();
-            const int ix = keyCombo_->findText(k, Qt::MatchFixedString);
-            if (ix >= 0) keyCombo_->setCurrentIndex(ix);
-        }
-        if (q.hasQueryItem("scale")) {
-            const QString sc = q.queryItemValue("scale").trimmed().toLower();
-            const int ix = scaleCombo_->findText(sc, Qt::MatchFixedString);
-            if (ix >= 0) scaleCombo_->setCurrentIndex(ix);
-        }
         if (q.hasQueryItem("algorithm")) {
             const int mode = parseAlgorithmMode(q.queryItemValue("algorithm"));
             const int ix = algorithmModeCombo_->findData(mode);
@@ -1792,6 +2102,7 @@ private:
             if (q.hasQueryItem("freq_max")) opts.freqMaxHz = q.queryItemValue("freq_max").toDouble();
             if (q.hasQueryItem("leakiness")) opts.leakiness = q.queryItemValue("leakiness").toDouble();
             if (q.hasQueryItem("base_a")) opts.baseAFrequencyHz = q.queryItemValue("base_a").toDouble();
+            if (q.hasQueryItem("octave_shift")) opts.octaveShift = std::clamp(q.queryItemValue("octave_shift").toInt(), -2, 2);
             if (q.hasQueryItem("voiced_threshold")) opts.voicedThreshold = q.queryItemValue("voiced_threshold").toFloat();
             if (q.hasQueryItem("ratio_smoothing")) opts.ratioSmoothing = q.queryItemValue("ratio_smoothing").toFloat();
             if (q.hasQueryItem("amplitude_smoothing")) opts.amplitudeSmoothing = q.queryItemValue("amplitude_smoothing").toFloat();
@@ -1800,8 +2111,13 @@ private:
             if (q.hasQueryItem("flow_overlap")) opts.flowOverlap = q.queryItemValue("flow_overlap").toFloat();
             if (q.hasQueryItem("flow_base_delay_ms")) opts.flowBaseDelayMs = q.queryItemValue("flow_base_delay_ms").toInt();
             if (q.hasQueryItem("flow_drift_correction")) opts.flowDriftCorrection = q.queryItemValue("flow_drift_correction").toFloat();
-            opts.keyRoot = parseKeyRoot(queryOr("key", keyCombo_->currentText()));
-            opts.minor = queryOr("scale", scaleCombo_->currentText()).trimmed().toLower() == "minor";
+            opts.pitchSystemId = queryOr("pitch_system", tuningCombo_->currentData().toString()).toStdString();
+            opts.pitchCollectionId = queryOr("pitch_collection", collectionCombo_->currentData().toString()).toStdString();
+            if (q.hasQueryItem("tonic_note")) opts.tonicMidiNote = q.queryItemValue("tonic_note").toInt();
+            if (q.hasQueryItem("degrees")) {
+                const auto values = jtune::parsePitchDegreeList(q.queryItemValue("degrees").toStdString());
+                if (values) { opts.pitchCollectionId = "custom"; opts.customEnabledDegrees = *values; }
+            }
             opts.algorithmMode = parseAlgorithmMode(queryOr("algorithm", algorithmName(algorithmModeCombo_->currentData().toInt())));
             opts.resynthMode = parseResynthMode(queryOr("resynth", resynthName(resynthModeCombo_->currentData().toInt())));
 
@@ -1813,8 +2129,9 @@ private:
                 {"verifier", "cross-over"},
                 {"verifier_algorithms", r.verifierAlgorithms},
                 {"sample_rate", static_cast<int>(opts.sampleRate)},
-                {"key_root", opts.keyRoot},
-                {"scale", opts.minor ? "minor" : "major"},
+                {"pitch_system_id", QString::fromStdString(opts.pitchSystemId)},
+                {"pitch_collection_id", QString::fromStdString(opts.pitchCollectionId)},
+                {"tonic_midi_note", opts.tonicMidiNote},
                 {"algorithm", algorithmName(opts.algorithmMode)},
                 {"resynth", resynthName(opts.resynthMode)},
                 {"raw_hz", r.rawHz},
@@ -1833,9 +2150,66 @@ private:
         writeJson(404, QJsonObject{{"ok", false}, {"error", "not found"}});
     }
 
+    std::vector<double> currentExpectedNoteHz() const
+    {
+        std::vector<double> frequencies;
+        const auto* definition = jtune::pitchSystemRegistry().byId(
+            tuningCombo_->currentData().toString().toStdString());
+        if (!definition) return frequencies;
+
+        jtune::PitchContext context;
+        context.referenceMidi = referenceNoteCombo_->currentData().toInt();
+        context.referenceHz = baseASpin_->value();
+        context.octaveShift = octaveShiftSpin_->value();
+        const jtune::PitchSystemEvaluator evaluator(*definition);
+        for (int midi = minMidiSpin_->value(); midi <= maxMidiSpin_->value(); ++midi) {
+            const auto frequency = evaluator.frequencyForMidi(midi, context);
+            if (frequency && *frequency > 0.0 && std::isfinite(*frequency))
+                frequencies.push_back(*frequency);
+        }
+        std::sort(frequencies.begin(), frequencies.end());
+        frequencies.erase(std::unique(frequencies.begin(), frequencies.end(), [](double a, double b) {
+            return std::abs(1200.0 * std::log2(a / b)) < 0.01;
+        }), frequencies.end());
+        return frequencies;
+    }
+
+    void showPitchMonitor()
+    {
+        if (!pitchMonitor_) {
+            pitchMonitor_ = new QDialog(this);
+            pitchMonitor_->setWindowTitle("JTune — Measured Pitch Monitor");
+            pitchMonitor_->resize(1100, 650);
+            auto* layout = new QVBoxLayout(pitchMonitor_);
+            auto* readings = new QHBoxLayout;
+
+            monitorInputLabel_ = new QLabel("INPUT\n-- Hz");
+            monitorOutputLabel_ = new QLabel("OUTPUT — MEASURED\n-- Hz");
+            monitorInputLabel_->setAlignment(Qt::AlignCenter);
+            monitorOutputLabel_->setAlignment(Qt::AlignCenter);
+            monitorInputLabel_->setStyleSheet(
+                "QLabel { color: #4fc3f7; background: #12161c; border: 2px solid #4fc3f7; "
+                "border-radius: 8px; padding: 12px; font-size: 22px; font-weight: 700; }");
+            monitorOutputLabel_->setStyleSheet(
+                "QLabel { color: #ffa726; background: #12161c; border: 2px solid #ffa726; "
+                "border-radius: 8px; padding: 12px; font-size: 22px; font-weight: 700; }");
+            readings->addWidget(monitorInputLabel_);
+            readings->addWidget(monitorOutputLabel_);
+            layout->addLayout(readings);
+
+            monitorGraph_ = new PitchHistoryWidget;
+            monitorGraph_->setMinimumHeight(440);
+            layout->addWidget(monitorGraph_, 1);
+        }
+        pitchMonitor_->show();
+        pitchMonitor_->raise();
+        pitchMonitor_->activateWindow();
+    }
+
     void onUiTick()
     {
         const auto snap = engine_.snapshot();
+        const auto expectedNoteHz = currentExpectedNoteHz();
 
         pitchLabel_->setText(
             QString("in: %1 Hz   out: %2 Hz   ratio: %3   underruns: %4")
@@ -1844,7 +2218,31 @@ private:
                 .arg(QString::number(snap.ratio, 'f', 3))
                 .arg(snap.underruns));
 
-        graph_->setData(snap.in, snap.out, minMidiSpin_->value(), maxMidiSpin_->value());
+        graph_->setData(snap.in,
+                        snap.out,
+                        snap.spectra,
+                        expectedNoteHz,
+                        snap.historySize,
+                        snap.spectrumMinHz,
+                        snap.spectrumMaxHz,
+                        minMidiSpin_->value(),
+                        maxMidiSpin_->value());
+
+        if (monitorGraph_) {
+            monitorGraph_->setData(snap.in,
+                                   snap.out,
+                                   snap.spectra,
+                                   expectedNoteHz,
+                                   snap.historySize,
+                                   snap.spectrumMinHz,
+                                   snap.spectrumMaxHz,
+                                   minMidiSpin_->value(),
+                                   maxMidiSpin_->value());
+            monitorInputLabel_->setText(
+                QString("INPUT\n%1 Hz").arg(QString::number(snap.inHz, 'f', 1)));
+            monitorOutputLabel_->setText(
+                QString("OUTPUT — MEASURED\n%1 Hz").arg(QString::number(snap.outHz, 'f', 1)));
+        }
 
         if (!engine_.isRunning() && startStopButton_->text() == "Stop") {
             startStopButton_->setText("Start");
@@ -1859,9 +2257,12 @@ private:
     QComboBox* apiCombo_ = nullptr;
     QComboBox* inputCombo_ = nullptr;
     QComboBox* outputCombo_ = nullptr;
-    QComboBox* keyCombo_ = nullptr;
-    QComboBox* scaleCombo_ = nullptr;
+    QComboBox* tuningCombo_ = nullptr;
+    QComboBox* collectionCombo_ = nullptr;
+    QComboBox* tonicNoteCombo_ = nullptr;
+    QComboBox* referenceNoteCombo_ = nullptr;
     QComboBox* profileCombo_ = nullptr;
+    std::vector<int> customEnabledDegrees_;
 
     QSlider* strengthSlider_ = nullptr;
     QLabel* strengthValue_ = nullptr;
@@ -1869,6 +2270,7 @@ private:
     QLabel* wetDryValue_ = nullptr;
 
     QSpinBox* sampleRateSpin_ = nullptr;
+    QSpinBox* octaveShiftSpin_ = nullptr;
     QSpinBox* bufferSpin_ = nullptr;
     QSpinBox* bufferCountSpin_ = nullptr;
     QSpinBox* minMidiSpin_ = nullptr;
@@ -1908,6 +2310,10 @@ private:
     QTabWidget* advancedTabs_ = nullptr;
 
     PitchHistoryWidget* graph_ = nullptr;
+    QDialog* pitchMonitor_ = nullptr;
+    PitchHistoryWidget* monitorGraph_ = nullptr;
+    QLabel* monitorInputLabel_ = nullptr;
+    QLabel* monitorOutputLabel_ = nullptr;
     QTimer* timer_ = nullptr;
     AdvancedSettings advanced_{};
     std::unique_ptr<QTcpServer> controlServer_;

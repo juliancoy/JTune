@@ -149,8 +149,6 @@ bool runCaseForAlgorithm(int algorithmMode)
 {
     jtune::AutotuneOptions base;
     base.sampleRate = 48000;
-    base.keyRoot = 0;
-    base.minor = false;
     base.minMidi = 50;
     base.maxMidi = 80;
     base.multiple = 24;
@@ -183,7 +181,7 @@ bool runCaseForAlgorithm(int algorithmMode)
 
     const double shiftHz = tunedHz - rawHz;
     const double rawMidi = hzToMidi(rawHz);
-    const int targetMidi = nearestScaleMidiForKey(rawMidi, base.keyRoot, base.minor);
+    const int targetMidi = static_cast<int>(std::lround(rawMidi));
     const double targetHz = midiToHz(static_cast<double>(targetMidi));
     double semitones = 12.0 * std::log2(targetHz / rawHz);
     semitones = std::clamp(semitones, -6.0, 6.0);

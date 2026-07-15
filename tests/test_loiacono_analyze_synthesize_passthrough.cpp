@@ -1,6 +1,8 @@
 #include "loiacono_pitch_shift.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <vector>
@@ -31,6 +33,40 @@ struct Metrics {
     double rmse = 0.0;
     double maxAbsErr = 0.0;
 };
+
+double toneProjection(const std::vector<float>& signal,
+                      unsigned int sampleRate,
+                      double frequencyHz,
+                      size_t offset)
+{
+    double real = 0.0;
+    double imag = 0.0;
+    for (size_t i = offset; i < signal.size(); ++i) {
+        const double angle = 2.0 * kPi * frequencyHz * static_cast<double>(i) /
+            static_cast<double>(sampleRate);
+        real += static_cast<double>(signal[i]) * std::cos(angle);
+        imag -= static_cast<double>(signal[i]) * std::sin(angle);
+    }
+    return std::hypot(real, imag);
+}
+
+double rms(const std::vector<float>& signal, size_t offset)
+{
+    if (offset >= signal.size()) return 0.0;
+    double energy = 0.0;
+    for (size_t i = offset; i < signal.size(); ++i) {
+        const double sample = static_cast<double>(signal[i]);
+        energy += sample * sample;
+    }
+    return std::sqrt(energy / static_cast<double>(signal.size() - offset));
+}
+
+double medianOfThree(double a, double b, double c)
+{
+    std::array<double, 3> values{a, b, c};
+    std::sort(values.begin(), values.end());
+    return values[1];
+}
 
 Metrics compareSignals(const std::vector<float>& a, const std::vector<float>& b, size_t offset)
 {
@@ -93,7 +129,7 @@ int main()
             analyze.getPhase(phase);
             synthesize.shiftFromAnalysis(analyze, spectrum, phase, 1.0f, cfg.freqMinHz, cfg.freqMaxHz);
         }
-        output[i] = synthesize.synthShiftedSample(analyze, 0.15f, 0.08f);
+        output[i] = synthesize.synthShiftedSample(analyze, 0.15f, 0.08f, 96);
     }
 
     const size_t settleOffset = static_cast<size_t>(cfg.sampleRate / 2);
@@ -112,6 +148,80 @@ int main()
     }
     if (m.maxAbsErr > 0.30) {
         std::cerr << "Passthrough max abs error too high: " << m.maxAbsErr << "\n";
+        return 1;
+    }
+
+    // Exercise the oscillator-bank path (ratio 1 is an intentional dry
+    // bypass). A stable phase reference should concentrate substantially more
+    // energy at the shifted frequency than at the original frequency.
+    loiacono::LoiaconoAnalyze shiftedAnalyze(cfg);
+    loiacono::LoiaconoSynthesize shiftedSynthesize;
+    shiftedSynthesize.reset(shiftedAnalyze.numBins());
+    constexpr double sourceHz = 440.0;
+    constexpr float shiftRatio = 1.059463094f;
+    // One second is long enough to expose synthesis work that accidentally
+    // scales with the absolute sample index, but short enough for this to
+    // remain a focused unit test. Equal-sized timing windows make the check
+    // relative to the host CPU instead of relying on a wall-clock deadline.
+    constexpr size_t timingWindowCount = 8;
+    const auto tone = generateChirp(cfg.sampleRate, 1.0, sourceHz, sourceHz);
+    std::vector<float> shifted(tone.size(), 0.0f);
+    std::array<double, timingWindowCount> windowTimes{};
+    const size_t timingWindowSamples = tone.size() / timingWindowCount;
+    hopCountdown = 96;
+    for (size_t i = 0; i < tone.size(); ++i) {
+        const auto sampleStart = std::chrono::steady_clock::now();
+        shiftedAnalyze.processSample(tone[i]);
+        if (--hopCountdown <= 0) {
+            hopCountdown = 96;
+            shiftedAnalyze.getSpectrum(spectrum);
+            shiftedAnalyze.getPhase(phase);
+            shiftedSynthesize.shiftFromAnalysis(
+                shiftedAnalyze, spectrum, phase, shiftRatio, cfg.freqMinHz, cfg.freqMaxHz);
+        }
+        shifted[i] = shiftedSynthesize.synthShiftedSample(shiftedAnalyze, 0.15f, 0.08f, 96);
+        const auto sampleEnd = std::chrono::steady_clock::now();
+        const size_t window = std::min(timingWindowCount - 1, i / timingWindowSamples);
+        windowTimes[window] += std::chrono::duration<double>(sampleEnd - sampleStart).count();
+    }
+    const size_t shiftedSettleOffset = static_cast<size_t>(cfg.sampleRate / 4);
+    const double targetHz = sourceHz * shiftRatio;
+    const double targetEnergy = toneProjection(shifted, cfg.sampleRate, targetHz, shiftedSettleOffset);
+    const double sourceEnergy = toneProjection(shifted, cfg.sampleRate, sourceHz, shiftedSettleOffset);
+    const double lowerSideEnergy = toneProjection(shifted, cfg.sampleRate, targetHz - 30.0, shiftedSettleOffset);
+    const double upperSideEnergy = toneProjection(shifted, cfg.sampleRate, targetHz + 30.0, shiftedSettleOffset);
+    const double shiftedRms = rms(shifted, shiftedSettleOffset);
+    const bool allFinite = std::all_of(shifted.begin(), shifted.end(), [](float sample) {
+        return std::isfinite(sample);
+    });
+    const double earlyMedian = medianOfThree(windowTimes[1], windowTimes[2], windowTimes[3]);
+    const double lateMedian = medianOfThree(windowTimes[5], windowTimes[6], windowTimes[7]);
+    const double slowdown = lateMedian / std::max(1e-9, earlyMedian);
+    std::cout << "[loiacono-shifted-tone] target/source="
+              << targetEnergy / std::max(1e-12, sourceEnergy)
+              << " target/lower-side=" << targetEnergy / std::max(1e-12, lowerSideEnergy)
+              << " target/upper-side=" << targetEnergy / std::max(1e-12, upperSideEnergy)
+              << " rms=" << shiftedRms
+              << " late/early-runtime=" << slowdown << "\n";
+    if (!allFinite) {
+        std::cerr << "Shifted synthesis produced a non-finite sample\n";
+        return 1;
+    }
+    if (shiftedRms < 0.005 || shiftedRms > 0.8) {
+        std::cerr << "Shifted synthesis RMS is outside the useful range: " << shiftedRms << "\n";
+        return 1;
+    }
+    if (targetEnergy < sourceEnergy * 4.0) {
+        std::cerr << "Shifted synthesis does not concentrate energy at the target frequency\n";
+        return 1;
+    }
+    if (targetEnergy < lowerSideEnergy * 4.0 || targetEnergy < upperSideEnergy * 4.0) {
+        std::cerr << "Shifted synthesis has excessive off-target spectral energy\n";
+        return 1;
+    }
+    if (slowdown > 1.8) {
+        std::cerr << "Spectral synthesis cost grows with elapsed sample count: "
+                  << slowdown << "x late/early\n";
         return 1;
     }
 

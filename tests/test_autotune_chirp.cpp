@@ -144,8 +144,6 @@ int main()
 {
     jtune::AutotuneOptions opts;
     opts.sampleRate = 48000;
-    opts.keyRoot = 0;   // C
-    opts.minor = false; // major
     opts.minMidi = 50;
     opts.maxMidi = 80;
     opts.multiple = 24;
@@ -157,7 +155,7 @@ int main()
     opts.algorithmMode = 0;
     opts.resynthMode = jtune::TimeDomain;
 
-    // C#4-ish chirp in C major (off-scale) => should be shifted downward.
+    // C#4-ish chirp is corrected to the nearest 12-EDO target.
     const double f0 = 275.0;
     const double f1 = 282.0;
     const auto chirp = generateChirp(opts.sampleRate, 4.0, f0, f1);
@@ -185,7 +183,7 @@ int main()
     std::cout << "tuned_hz=" << tunedHz << " tuned_midi=" << tunedMidi << "\n";
 
     const double shiftHz = tunedHz - rawHz;
-    const int targetMidi = nearestScaleMidiForKey(hzToMidi(rawHz), opts.keyRoot, opts.minor);
+    const int targetMidi = static_cast<int>(std::lround(hzToMidi(rawHz)));
     const double targetHz = midiToHz(static_cast<double>(targetMidi));
     const double rawErrHz = std::abs(rawHz - targetHz);
     const double tunedErrHz = std::abs(tunedHz - targetHz);

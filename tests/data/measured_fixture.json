@@ -1,0 +1,25 @@
+{
+  "id": "org.jtune.test.measured-fixture",
+  "version": "1.0.0",
+  "display_name": "Synthetic measured test fixture",
+  "scope": "Automated tests only",
+  "model_type": "measured",
+  "period_behavior": "register_specific",
+  "period_ratio": 0,
+  "author_or_community": "JTune test suite",
+  "reviewed": false,
+  "limitations": "Synthetic data; represents no musical practice.",
+  "appropriate_use": "Parser and evaluator tests only.",
+  "sources": [
+    {"citation": "JTune synthetic test fixture", "url": "", "license": "CC0-1.0"}
+  ],
+  "targets": [
+    {"id": "fixture-a", "name": "Fixture A", "frequency_hz": 220.0,
+     "uncertainty_cents": 0.2, "confidence": 1.0, "register_min": 57,
+     "register_max": 57, "direction": "unknown", "instrument": "synthetic"},
+    {"id": "fixture-b", "name": "Fixture B", "frequency_hz": 331.0,
+     "uncertainty_cents": 0.3, "confidence": 0.9, "register_min": 64,
+     "register_max": 64, "direction": "ascending", "instrument": "synthetic",
+     "paired_target_id": "fixture-a", "beat_rate_hz": 0.0}
+  ]
+}

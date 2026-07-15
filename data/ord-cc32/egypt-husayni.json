@@ -1,0 +1,82 @@
+{
+  "id": "org.jtune.ord-cc32.egypt.husayni",
+  "version": "zenodo-15682346",
+  "display_name": "Cairo 1932 observed — husayni / Egypt (n=2)",
+  "tradition": "1932 Cairo Congress historical performance",
+  "region": "Egypt",
+  "scope": "Tonic-aligned aggregate for recordings tagged husayni from Egypt",
+  "model_type": "measured",
+  "period_behavior": "octave",
+  "period_ratio": 2.0,
+  "author_or_community": "ORD-CC32; Baris Bozkurt and Arthur Diniz De Souza",
+  "measurement_date": "1932 recordings; features published 2025-06-17",
+  "reviewed": false,
+  "correction_eligible": false,
+  "limitations": "Historical corpus-derived candidate, not Saudi, contemporary, universal, or a complete model of sayr/modulation. Peak centers are computational estimates from tonic-aligned histograms.",
+  "appropriate_use": "Historical Cairo-1932 comparison and cautious correction only within the matching region/maqam label.",
+  "sources": [
+    {
+      "citation": "Bozkurt (2025), ORD-CC32, 10.5281/zenodo.15682346",
+      "url": "https://doi.org/10.5281/zenodo.15682346",
+      "license": "CC BY-NC 4.0"
+    }
+  ],
+  "targets": [
+    {
+      "id": "observed-degree-1",
+      "name": "Observed center 140 cents",
+      "cents": 140.0,
+      "ratio": 1.0842268703014184,
+      "uncertainty_cents": 20.89,
+      "confidence": 0.095
+    },
+    {
+      "id": "observed-degree-2",
+      "name": "Observed center 300 cents",
+      "cents": 300.0,
+      "ratio": 1.189207115002721,
+      "uncertainty_cents": 20.6,
+      "confidence": 0.115
+    },
+    {
+      "id": "observed-degree-3",
+      "name": "Observed center 500 cents",
+      "cents": 500.0,
+      "ratio": 1.3348398541700344,
+      "uncertainty_cents": 21.19,
+      "confidence": 0.225
+    },
+    {
+      "id": "observed-degree-4",
+      "name": "Observed center 740 cents",
+      "cents": 740.0,
+      "ratio": 1.5333283446696007,
+      "uncertainty_cents": 22.06,
+      "confidence": 0.261
+    },
+    {
+      "id": "observed-degree-5",
+      "name": "Observed center 860 cents",
+      "cents": 860.0,
+      "ratio": 1.6433806291715807,
+      "uncertainty_cents": 21.24,
+      "confidence": 0.315
+    },
+    {
+      "id": "observed-degree-6",
+      "name": "Observed center 1000 cents",
+      "cents": 1000.0,
+      "ratio": 1.7817974362806785,
+      "uncertainty_cents": 21.34,
+      "confidence": 0.4
+    },
+    {
+      "id": "octave",
+      "name": "Octave",
+      "cents": 1200.0,
+      "ratio": 2.0,
+      "uncertainty_cents": 10.0,
+      "confidence": 0.95
+    }
+  ]
+}
